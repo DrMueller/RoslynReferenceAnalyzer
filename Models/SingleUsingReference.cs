@@ -2,7 +2,5 @@
 
 namespace RoslynReferenceAnalyzer.Models
 {
-    public record SingleUsingReference(
-        INamedTypeSymbol SourceType,
-        IReadOnlyCollection<Document> TargetDocuments);
+    public record SingleUsingReference(INamedTypeSymbol SourceType);
 }

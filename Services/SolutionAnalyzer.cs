@@ -1,6 +1,7 @@
 ﻿using System.Collections.Concurrent;
 using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.MSBuild;
@@ -19,60 +20,91 @@ namespace RoslynReferenceAnalyzer.Services
 
             using var ws = MSBuildWorkspace.Create();
             var sln = await ws.OpenSolutionAsync(solutionPath);
-
-            var prodProjects = sln.Projects.Where(p => !IsTestProject(p)).ToArray();
-
-            // Lets just use application layer for the time being
+            var prodProjects = sln.Projects.Where(p => !CheckIsTestProject(p)).ToArray();
             prodProjects = prodProjects.Where(p => p.Name.EndsWith("Application", StringComparison.OrdinalIgnoreCase)).ToArray();
-
-            var docIsTest = new Dictionary<DocumentId, bool>();
-            foreach (var projects in sln.Projects)
-            foreach (var d in projects.Documents)
-            {
-                docIsTest[d.Id] = IsTestProject(projects);
-            }
-
             var prodTypes = await CreateProdTypesAsync(prodProjects);
-
             var bag = new ConcurrentBag<SingleUsingReference>();
 
             await Parallel.ForEachAsync(prodTypes, async (type, ct) =>
             {
-                var references = await SymbolFinder.FindReferencesAsync(type, sln, ct);
-                var allRefLocations = new List<Document>();
-                var hasNonTestRef = false;
+                var onlyUsedByTestsOrMediatr = await UsedOnlyByTestsOrMediatRHandlersAsync(sln, type, ct);
 
-                foreach (var refItem in references)
+                if (onlyUsedByTestsOrMediatr)
                 {
-                    foreach (var loc in refItem.Locations)
-                    {
-                        var doc = sln.GetDocument(loc.Document.Id);
-                        if (doc is null)
-                        {
-                            continue;
-                        }
-
-                        var isTest = docIsTest.TryGetValue(doc.Id, out var flag) && flag;
-
-                        if (!isTest)
-                        {
-                            hasNonTestRef = true;
-                        }
-
-                        allRefLocations.Add(doc);
-                    }
-                }
-
-                if ((!hasNonTestRef && allRefLocations.Count > 0) || !allRefLocations.Any())
-                {
-                    bag.Add(new SingleUsingReference(type, allRefLocations));
+                    bag.Add(new SingleUsingReference(type));
                 }
             });
 
             return bag;
         }
 
-        private static bool IsTestProject(Project p)
+        private static async Task<bool> UsedOnlyByTestsOrMediatRHandlersAsync(
+            Solution solution,
+            ISymbol candidate,
+            CancellationToken ct = default)
+        {
+            var refs = await SymbolFinder.FindReferencesAsync(candidate, solution, ct);
+            var usedOnlyByTestsOrMediatr = true;
+
+            foreach (var r in refs)
+            {
+                foreach (var loc in r.Locations)
+                {
+                    var doc = solution.GetDocument(loc.Document.Id);
+                    if (doc is null)
+                    {
+                        continue;
+                    }
+
+                    if (CheckIsTestProject(doc.Project))
+                    {
+                        continue;
+                    }
+
+                    var isMediatrHandler = await CheckIsMediatRHandler(doc, candidate);
+                    if (isMediatrHandler)
+                    {
+                        continue;
+                    }
+
+                    usedOnlyByTestsOrMediatr = false;
+                    break;
+                }
+            }
+
+            return usedOnlyByTestsOrMediatr;
+        }
+
+        private static async Task<bool> CheckIsMediatRHandler(Document doc, ISymbol candidate)
+        {
+            var model = await doc.GetSemanticModelAsync();
+            var root = await doc.GetSyntaxRootAsync();
+            if (model is null || root is null)
+            {
+                return false;
+            }
+
+            var classDeclaration = root.DescendantNodesAndSelf()
+                .OfType<ClassDeclarationSyntax>()
+                .SingleOrDefault();
+
+            if (classDeclaration is null)
+            {
+                return false;
+            }
+
+            var baseListSyntax = classDeclaration.DescendantNodes()
+                .OfType<BaseListSyntax>()
+                .Single();
+
+            var identifiers = baseListSyntax.DescendantNodes()
+                .OfType<IdentifierNameSyntax>()
+                .ToList();
+
+            return identifiers.Any(g => g.Identifier.Text == candidate.Name);
+        }
+
+        private static bool CheckIsTestProject(Project p)
         {
             return p.Name.Contains("Tests", StringComparison.OrdinalIgnoreCase) && !p.Name.EndsWith("Testing.Common");
         }
@@ -105,8 +137,7 @@ namespace RoslynReferenceAnalyzer.Services
 
                     foreach (var node in root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>())
                     {
-                        var symbol = model.GetDeclaredSymbol(node) as INamedTypeSymbol;
-                        if (symbol is null)
+                        if (model.GetDeclaredSymbol(node) is not { } symbol)
                         {
                             continue;
                         }
