@@ -84,9 +84,10 @@ namespace RoslynReferenceAnalyzer.Services
                 return false;
             }
 
-            var classDeclaration = root.DescendantNodesAndSelf()
+            var classDeclaration = root
+                .DescendantNodesAndSelf()
                 .OfType<ClassDeclarationSyntax>()
-                .SingleOrDefault();
+                .SingleOrDefault(f => f.Identifier.Text.EndsWith("Handler"));
 
             if (classDeclaration is null)
             {
